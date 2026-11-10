@@ -129,6 +129,11 @@ parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "r
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
+parser.add_argument("--aux_motion_dir", type=str, default=None, help="world-model-only data: clips the policy plays in a "
+                    "separate simulator; their transitions train the world model only (never the policy, critic or normalizers)")
+parser.add_argument("--aux_envs", type=int, default=512)
+parser.add_argument("--aux_share", type=float, default=0.25, help="share of each world-model batch drawn from the aux buffer")
+parser.add_argument("--aux_test", action="store_true", help="check the aux invariants; writes aux_test.json to --log_dir")
 args = parser.parse_args()
 
 import torch
@@ -355,10 +360,21 @@ def _mirror_windows(w: dict, n: int) -> dict:
     return out
 
 
+AUX = args.aux_motion_dir is not None
+N_AUX = round(args.aux_share * args.wm_batch) if AUX else 0
+AUX_STATS = {}  # --aux_test
+
+
 def wm_update():
-    w = buffer.sample_windows(args.wm_batch, args.wm_window)
+    w = buffer.sample_windows(args.wm_batch - N_AUX, args.wm_window)
     if mirror is not None:
-        w = _mirror_windows(w, int(args.wm_batch * args.wm_mirror))
+        w = _mirror_windows(w, int((args.wm_batch - N_AUX) * args.wm_mirror))
+    if N_AUX:
+        wa = aux_buffer.sample_windows(N_AUX, args.wm_window)
+        if mirror is not None:
+            wa = _mirror_windows(wa, int(N_AUX * args.wm_mirror))
+        w = {k: torch.cat((w[k], wa[k])) for k in w}
+        AUX_STATS["mix_count"] = wa["s"].shape[0] == N_AUX and w["s"].shape[0] == args.wm_batch
     S_hat = wm_rollout(w["s"], w["a"], w["a_prev"], w["xi"])
     loss, e_last = wm_err(S_hat, w["s1"], w["mask"])
     opt_wm.zero_grad(set_to_none=True)
@@ -434,6 +450,8 @@ class Graphed:
 
 def policy_update():
     s, h = sample_valid_starts(args.pi_batch)
+    if AUX:
+        AUX_BAD.add_((s["f"] < 0).sum())
     S = unflatten_state(s["s"])
     xi, f, a_prev = s["xi"], s["f"], s["a_prev"]
     xi_n = normalize_xi(xi)
@@ -662,6 +680,44 @@ def collect(n_steps: int, stats: dict):
             stats["term"].append(out["term"].float().sum())
             stats["done"].append(out["done"].float().sum())
 
+
+# ---------------- AuxSource (--aux_motion_dir): world-model-only transitions ----------------
+# The aux buffer is read by wm_update only; its frame index is the sentinel -1, so a policy start drawn from it would be
+# caught (AUX_BAD). Collection here updates no normalizer, so the policy, critic and normalizers never see aux data.
+if AUX:
+    aux_motion = MotionLib.from_dir(args.aux_motion_dir, robot, kin, dev)
+    if args.ref_contact_fix:
+        aux_motion.set_ref_contact(FEET)
+    assert aux_motion.goal_dim(K) == GOAL_DIM
+    aux_mdp = MDP(kin, aux_motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing)
+    aux_mdp.feet = FEET
+    if args.compile_more:
+        aux_mdp.reward, aux_mdp.termination, aux_mdp.obs = torch.compile(aux_mdp.reward), torch.compile(aux_mdp.termination), torch.compile(aux_mdp.obs)
+        aux_motion.goal = torch.compile(aux_motion.goal)
+    aux_env = TrackingSim(make_sim(robot), args.aux_envs, robot, aux_motion, aux_mdp, dev, gamma=args.gamma,
+                          fail_reset=args.fail_reset, bin_fix=args.bin_fix)  # fmt: skip
+    aux_buffer = ReplayBuffer(args.buffer_steps, args.aux_envs, dev, J, layout.dim)
+    aux_obs_hist = torch.zeros(args.aux_envs, Hh, mdp.obs_dim, device=dev)
+    AUX_BAD = torch.zeros((), dtype=torch.long, device=dev)
+    NORMS = (pi.obs_norm, pi.goal_norm, wm.in_norm, wm.out_norm, wm.inc_norm)
+
+
+@torch.no_grad()
+def aux_collect(n_steps: int):
+    global aux_obs_hist
+    snap = [{k: v.clone() for k, v in m.state_dict().items()} for m in NORMS] if args.aux_test and "norms_untouched" not in AUX_STATS else None
+    for _ in range(n_steps):
+        o = aux_env.observe()
+        fresh = aux_env.ep_step == 0
+        aux_obs_hist = torch.where(fresh[:, None, None], o.unsqueeze(1).expand_as(aux_obs_hist), torch.cat((aux_obs_hist[:, 1:], o.unsqueeze(1)), 1))
+        a = pi(aux_obs_hist, aux_motion.goal(aux_env.f, K))
+        a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
+        out = aux_env.step(a)
+        aux_buffer.add({**out, "f": torch.full_like(out["f"], -1)})
+    if snap is not None and n_steps > 0:
+        AUX_STATS["norms_untouched"] = all(torch.equal(v, m.state_dict()[k]) for s, m in zip(snap, NORMS) for k, v in s.items())
+
+
 if GRAPH:
     assert not args.reset_masked or args.collect_graph, "--reset_masked needs --collect_graph"
     if args.reset_masked:
@@ -669,6 +725,8 @@ if GRAPH:
     assert not args.collect_graph or (args.graph_early and not env.push_enabled and not pipe.stateful), \
         "--collect_graph: needs --graph_early; no pushes, sensing state"
     buffer.use_device_ptr(device_size=args.graph_early)
+    if AUX:
+        aux_buffer.use_device_ptr(device_size=args.graph_early)
     # captured sampling has static bounds (buffer.size): capture once the buffer is full (--graph_early: device-side
     # bounds, capture at once)
     full = (lambda: True) if args.graph_early else (lambda: buffer.size == buffer.T)
@@ -924,6 +982,8 @@ for it in range(start_it, args.iterations):
     if args.eprobe_async:
         eprobe_async_tick(launch=True)
     collect(n, stats)
+    if AUX:
+        aux_collect(n)
     for _ in range(args.wm_batches):
         l, e8 = wm_update_g()
     agg["wm"].append(l), agg["wm8"].append(e8)
@@ -995,3 +1055,8 @@ for it in range(start_it, args.iterations):
 if CKPT_POOL is not None:  # every background checkpoint written (a failed write raises here: non-zero exit)
     ckpt_wait(drain=True)
     CKPT_POOL.shutdown()
+if AUX and args.aux_test:
+    AUX_STATS["starts_main_only"] = POLICY_START is not None and int(AUX_BAD) == 0
+    with open(os.path.join(args.log_dir, "aux_test.json"), "w") as fh:
+        json.dump({k: bool(v) for k, v in AUX_STATS.items()}, fh)
+    print(f"--aux_test: {AUX_STATS}", flush=True)
